@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <title>Lot Suggestion Tool</title>
+
+  <!-- PWA manifest + icons -->
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="./icon-192.png" />
+
+  <!-- Tailwind via Play CDN: lets us use utility classes with no build step -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React 18 from CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+  <!-- Babel Standalone: compiles the JSX in app.js on page load -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    html, body, #root { min-height: 100vh; }
+    body {
+      background: #0f172a;
+      color: #f1f5f9;
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div style="padding: 2rem; text-align: center; color: #94a3b8;">Loading…</div>
+  </div>
+
+  <!-- The whole app. Loaded as text/babel so JSX is compiled in the browser. -->
+  <script type="text/babel" src="./app.js"></script>
+
+  <!-- Register the service worker so the app becomes installable as a PWA -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker
+          .register('./sw.js')
+          .catch(err => console.log('Service worker registration failed:', err));
+      });
+    }
+  </script>
+</body>
+</html>
