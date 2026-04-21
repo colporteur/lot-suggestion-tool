@@ -132,6 +132,27 @@ Respond ONLY with valid JSON:
 
 // ======================== 2. Image compression ========================
 
+// Copy a picked file's bytes into memory so the returned File no longer
+// depends on the OS-level file reference. Android/Chrome gallery picks hand
+// us references that can expire within seconds — when that happens, later
+// reads throw NotReadableError ("permission problems that have occurred
+// after a reference to a file was acquired"). Snapshotting at pick-time
+// defeats that entirely: once the bytes are in an in-memory ArrayBuffer,
+// the OS can revoke whatever it wants.
+async function snapshotFile(file) {
+  const name = file.name || 'unnamed.jpg';
+  const sizeKB = Math.round((file.size || 0) / 1024);
+  try {
+    const buffer = await file.arrayBuffer();
+    return new File([buffer], name, { type: file.type || 'image/jpeg' });
+  } catch (err) {
+    throw new Error(
+      `Could not capture "${name}" (${sizeKB} KB): ${err.message || err}. ` +
+      `If this is a Google Photos item, open it once in the Photos app to download it locally, then retry.`
+    );
+  }
+}
+
 async function blobToBase64(blob) {
   // FileReader's onerror fires with a ProgressEvent, not a real Error. If we
   // let that propagate, the UI shows "[object ProgressEvent]". Wrap it with a
@@ -523,17 +544,70 @@ function KeyInput({ apiKey, onChange }) {
   );
 }
 
-function PhotoUpload({ images, onChange, label }) {
+function PhotoUpload({ images, onChange, onError, label }) {
   const cameraRef = useRef(null);
   const galleryRef = useRef(null);
+  const [reading, setReading] = useState(false);
 
-  function handleFiles(e) {
+  // Cache thumbnail object URLs per File, so we don't create a fresh blob URL
+  // on every render (each render would leak one). Revoked when the image is
+  // removed or the component unmounts.
+  const [thumbUrls, setThumbUrls] = useState(() => new Map());
+  useEffect(() => {
+    setThumbUrls((prev) => {
+      const next = new Map();
+      for (const f of images) {
+        if (prev.has(f)) next.set(f, prev.get(f));
+        else next.set(f, URL.createObjectURL(f));
+      }
+      // Revoke URLs for any files that were removed.
+      for (const [f, url] of prev) {
+        if (!next.has(f)) URL.revokeObjectURL(url);
+      }
+      return next;
+    });
+  }, [images]);
+  useEffect(() => () => {
+    // On unmount, revoke every URL we've created.
+    for (const url of thumbUrls.values()) URL.revokeObjectURL(url);
+  }, []);
+
+  async function handleFiles(e) {
     const files = Array.from(e.target.files || []);
-    onChange([...images, ...files]);
     e.target.value = '';
+    if (files.length === 0) return;
+
+    setReading(true);
+    try {
+      // Snapshot each picked file IMMEDIATELY. Android gallery references can
+      // go stale before the user taps "Suggest lots"; reading bytes now puts
+      // them in an in-memory File that will survive regardless.
+      const snapshots = [];
+      const failures = [];
+      for (const file of files) {
+        try {
+          snapshots.push(await snapshotFile(file));
+        } catch (err) {
+          failures.push(err.message || String(err));
+        }
+      }
+      if (snapshots.length) onChange([...images, ...snapshots]);
+      if (failures.length && onError) {
+        onError(
+          `Couldn't capture ${failures.length} of ${files.length} photo(s):\n\n` +
+          failures.join('\n\n')
+        );
+      }
+    } finally {
+      setReading(false);
+    }
   }
 
   function removeAt(idx) {
+    const removed = images[idx];
+    if (removed && thumbUrls.has(removed)) {
+      URL.revokeObjectURL(thumbUrls.get(removed));
+    }
     onChange(images.filter((_, i) => i !== idx));
   }
 
@@ -548,7 +622,7 @@ function PhotoUpload({ images, onChange, label }) {
           {images.map((file, i) => (
             <div key={i} className="relative">
               <img
-                src={URL.createObjectURL(file)}
+                src={thumbUrls.get(file)}
                 alt={`upload ${i + 1}`}
                 className="w-full h-24 object-cover rounded"
               />
@@ -571,17 +645,19 @@ function PhotoUpload({ images, onChange, label }) {
       <div className="grid grid-cols-2 gap-2">
         <button
           type="button"
+          disabled={reading}
           onClick={() => cameraRef.current && cameraRef.current.click()}
-          className="rounded bg-indigo-600 hover:bg-indigo-500 py-3 text-sm font-medium"
+          className="rounded bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 py-3 text-sm font-medium"
         >
-          Take photo
+          {reading ? 'Reading…' : 'Take photo'}
         </button>
         <button
           type="button"
+          disabled={reading}
           onClick={() => galleryRef.current && galleryRef.current.click()}
-          className="rounded bg-slate-600 hover:bg-slate-500 py-3 text-sm font-medium"
+          className="rounded bg-slate-600 hover:bg-slate-500 disabled:opacity-50 py-3 text-sm font-medium"
         >
-          From gallery
+          {reading ? 'Reading…' : 'From gallery'}
         </button>
       </div>
     </div>
@@ -825,7 +901,7 @@ function NotRecommendedView({ result }) {
   );
 }
 
-function StragglerForm({ onSubmit, loading }) {
+function StragglerForm({ onSubmit, onError, loading }) {
   const [mode, setMode] = useState('photo'); // 'photo' | 'text'
   const [images, setImages] = useState([]);
   const [text, setText] = useState('');
@@ -870,7 +946,7 @@ function StragglerForm({ onSubmit, loading }) {
       </div>
 
       {mode === 'photo' ? (
-        <PhotoUpload images={images} onChange={setImages} label="Straggler photos" />
+        <PhotoUpload images={images} onChange={setImages} onError={onError} label="Straggler photos" />
       ) : (
         <textarea
           value={text}
@@ -1046,7 +1122,7 @@ function App() {
         </div>
       )}
 
-      <PhotoUpload images={images} onChange={setImages} label="Photos" />
+      <PhotoUpload images={images} onChange={setImages} onError={setError} label="Photos" />
       <LotControls
         targetLotCount={targetLotCountStr}
         fuzzy={fuzzy}
@@ -1082,7 +1158,7 @@ function App() {
       {result && (
         <>
           <LotsView result={result} onDissolve={handleDissolveLot} />
-          <StragglerForm onSubmit={handleAddStragglers} loading={loading} />
+          <StragglerForm onSubmit={handleAddStragglers} onError={setError} loading={loading} />
           {loading && (
             <div className="rounded border border-slate-700 bg-slate-800 p-3 text-sm text-slate-300 text-center">
               {loadingMessage || 'Working…'}
