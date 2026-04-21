@@ -73,12 +73,19 @@ Every change goes through GitHub's web UI:
 - Vision calls cost a few cents per batch at current rates. Set a spend cap in the Anthropic console to sleep easier.
 - Because the key is usable from the browser, don't hand this URL to other people — they could paste their own key and use your deployment, but more importantly, the public repo design assumes you're the only user.
 
+## Features
+
+- **Numbered lots** with stable numbers — dissolving a lot doesn't renumber the rest, so your physical piles stay consistent mid-sort.
+- **Sorting guide**: a section under the lots listing every item grouped by source photo, with each item's lot number next to it. Use it to pick items off the physical pile and drop them into labeled bins.
+- **Copy-to-clipboard pills**: each lot has a clean eBay-ready title as a clickable pill. Tap it, paste into eBay.
+- **Stragglers form**: at the bottom of the results, add items Claude missed — either a new photo or a typed list (one item per line). They get placed into existing lots; new lots only when truly needed. Existing assignments aren't touched.
+- **Dissolve a lot**: if a lot looks wrong, the "Dissolve" button sends its items back to be reassigned into the remaining existing lots (no new lots created during dissolve).
+- **Take photo OR from gallery**: two buttons in each photo picker, pick whichever you need.
+- **Not recommended section**: Claude flags items that shouldn't be lotted (e.g. obvious damage) with a reason, used sparingly.
+
 ## Roadmap
 
-Things to add in future iterations:
-
-- Drag items between lots after Claude's first pass
-- "Draft eBay listing" button per lot
-- Per-category prompt tuning (CDs vs. matchbooks vs. patterns)
+- Drag items between lots manually after Claude's first pass
 - Save past batches
+- Per-category prompt tuning (preset category buttons)
 - Multi-user version with a serverless proxy
