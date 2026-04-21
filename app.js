@@ -193,7 +193,40 @@ async function decodeImage(file) {
   }
 }
 
+// Formats Claude accepts directly as image content.
+const SUPPORTED_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
 async function compressImage(file) {
+  // HEIC/zero-byte detection runs regardless of the fast path.
+  const nameLower = (file.name || '').toLowerCase();
+  const isHeic = /image\/hei[cf]/.test(file.type || '') ||
+                 nameLower.endsWith('.heic') || nameLower.endsWith('.heif');
+  if (isHeic) {
+    throw new Error(
+      `"${file.name || 'unnamed'}" is in HEIC/HEIF format, which Chrome can't read in-browser. ` +
+      `Fix: open your camera settings and switch the photo format to JPEG (sometimes called "Most compatible"), or re-save this photo as JPEG.`
+    );
+  }
+  if (!file.size || file.size === 0) {
+    throw new Error(
+      `"${file.name || 'unnamed'}" has zero bytes. If you picked it from Google Photos, it may still be in the cloud — open it once in the Photos app to download it locally, then retry.`
+    );
+  }
+
+  // Fast path: if the file is already a supported format and small enough,
+  // base64-encode the bytes directly and skip decoding entirely. This avoids
+  // the (sometimes-fragile) browser image decode step for images that don't
+  // need resizing — which is most phone photos.
+  const estimatedBase64 = Math.ceil(file.size * 4 / 3);
+  if (
+    SUPPORTED_MEDIA_TYPES.includes(file.type) &&
+    estimatedBase64 <= MAX_BASE64_BYTES
+  ) {
+    return await blobToBase64(file);
+  }
+
+  // Slow path: need to resize or convert. Decode, draw to canvas, re-encode as JPEG,
+  // step the quality down until the result fits under the limit.
   const source = await decodeImage(file);
 
   let width = source.width;
