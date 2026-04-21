@@ -542,8 +542,9 @@ function LotControls({
         <label className="block text-sm font-medium text-slate-300 mb-2">Target number of lots</label>
         <input
           type="number" min={1} max={50}
+          inputMode="numeric"
           value={targetLotCount}
-          onChange={(e) => onChangeLotCount(Number(e.target.value))}
+          onChange={(e) => onChangeLotCount(e.target.value)}
           className="w-24 rounded bg-slate-900 border border-slate-700 px-3 py-2 text-sm text-slate-100"
         />
         <label className="inline-flex items-center ml-4 text-sm">
@@ -560,6 +561,43 @@ function LotControls({
           placeholder="e.g. CDs, vinyl records, matchbooks, sewing patterns"
           className="w-full rounded bg-slate-900 border border-slate-700 px-3 py-2 text-sm text-slate-100"
         />
+      </div>
+    </div>
+  );
+}
+
+// Modal overlay for app settings (currently just the API key).
+function SettingsModal({ open, onClose, apiKey, onChangeApiKey }) {
+  if (!open) return null;
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50"
+      onClick={onClose}
+    >
+      <div
+        className="bg-slate-900 rounded-lg max-w-md w-full p-4 space-y-4 border border-slate-700"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Settings</h2>
+          <button
+            onClick={onClose}
+            className="text-slate-400 hover:text-white text-2xl leading-none w-8 h-8 flex items-center justify-center rounded hover:bg-slate-800"
+            aria-label="Close settings"
+          >
+            ×
+          </button>
+        </div>
+        <KeyInput apiKey={apiKey} onChange={onChangeApiKey} />
+        <p className="text-xs text-slate-500">
+          Stored only in this browser on this device. Sent only to Anthropic's API, never anywhere else.
+        </p>
+        <button
+          onClick={onClose}
+          className="w-full rounded bg-slate-700 hover:bg-slate-600 py-2 text-sm font-medium"
+        >
+          Done
+        </button>
       </div>
     </div>
   );
@@ -828,7 +866,11 @@ function LotsView({ result, onDissolve }) {
 function App() {
   const [apiKey, setApiKey] = useState(() => localStorage.getItem(LS_API_KEY) || '');
   const [images, setImages] = useState([]);
-  const [targetLotCount, setTargetLotCount] = useState(5);
+  // Keep lot count as a STRING so the input can be cleared cleanly (no phantom "0"
+  // appearing when the user deletes the value to type a new one). Convert to a number
+  // where we actually need the numeric value.
+  const [targetLotCountStr, setTargetLotCountStr] = useState('5');
+  const targetLotCount = parseInt(targetLotCountStr, 10) || 0;
   const [fuzzy, setFuzzy] = useState(true);
   const [itemCategory, setItemCategory] = useState(() => localStorage.getItem(LS_CATEGORY) || '');
 
@@ -837,8 +879,18 @@ function App() {
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
 
+  // Settings modal visibility. Auto-open on first load if no key has ever been saved.
+  const [showSettings, setShowSettings] = useState(() => !localStorage.getItem(LS_API_KEY));
+
   useEffect(() => { localStorage.setItem(LS_API_KEY, apiKey); }, [apiKey]);
   useEffect(() => { localStorage.setItem(LS_CATEGORY, itemCategory); }, [itemCategory]);
+
+  function handleStartOver() {
+    if (!window.confirm('Clear the current batch and start over? (Your API key and category will be kept.)')) return;
+    setImages([]);
+    setResult(null);
+    setError('');
+  }
 
   async function handleSubmit() {
     setError('');
@@ -910,24 +962,40 @@ function App() {
     }
   }
 
-  const canSubmit = apiKey && images.length > 0 && !loading;
+  const canSubmit = apiKey && images.length > 0 && !loading && targetLotCount > 0;
+  const canStartOver = !loading && (images.length > 0 || result);
 
   return (
     <div className="max-w-2xl mx-auto p-4 space-y-4">
-      <header className="py-4">
-        <h1 className="text-2xl font-bold">Lot Suggestion Tool</h1>
-        <p className="text-sm text-slate-400">
-          Photograph a batch of items. Claude groups them into themed lots for eBay.
-        </p>
+      <header className="py-4 flex items-start justify-between gap-2">
+        <div>
+          <h1 className="text-2xl font-bold">Lot Suggestion Tool</h1>
+          <p className="text-sm text-slate-400">
+            Photograph a batch of items. Claude groups them into themed lots for eBay.
+          </p>
+        </div>
+        <button
+          onClick={() => setShowSettings(true)}
+          className="shrink-0 rounded p-2 text-xl hover:bg-slate-800"
+          aria-label="Settings"
+          title="Settings"
+        >
+          ⚙
+        </button>
       </header>
 
-      <KeyInput apiKey={apiKey} onChange={setApiKey} />
+      {!apiKey && (
+        <div className="rounded border border-amber-700 bg-amber-900/30 p-3 text-sm text-amber-200">
+          No API key set. Tap the gear icon to add one before running.
+        </div>
+      )}
+
       <PhotoUpload images={images} onChange={setImages} label="Photos" />
       <LotControls
-        targetLotCount={targetLotCount}
+        targetLotCount={targetLotCountStr}
         fuzzy={fuzzy}
         itemCategory={itemCategory}
-        onChangeLotCount={setTargetLotCount}
+        onChangeLotCount={setTargetLotCountStr}
         onChangeFuzzy={setFuzzy}
         onChangeCategory={setItemCategory}
       />
@@ -939,6 +1007,15 @@ function App() {
       >
         {loading && !result ? (loadingMessage || 'Thinking…') : 'Suggest lots'}
       </button>
+
+      {canStartOver && (
+        <button
+          onClick={handleStartOver}
+          className="w-full rounded border border-slate-600 hover:border-red-600 hover:text-red-300 py-2 text-sm text-slate-400"
+        >
+          Start over
+        </button>
+      )}
 
       {error && (
         <div className="rounded border border-red-700 bg-red-900/40 p-3 text-sm text-red-200">
@@ -961,6 +1038,13 @@ function App() {
       <footer className="text-xs text-slate-500 text-center py-6">
         Your API key stays on this device. Calls go directly to Anthropic.
       </footer>
+
+      <SettingsModal
+        open={showSettings}
+        onClose={() => setShowSettings(false)}
+        apiKey={apiKey}
+        onChangeApiKey={setApiKey}
+      />
     </div>
   );
 }
