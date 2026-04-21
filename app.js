@@ -33,7 +33,7 @@ Each item has a "source" field labeling where it came from:
 
 Every lot has:
 - "title": a richer display title that can reference theme, era, artists (80+ chars OK)
-- "short_title": a clean, keyword-rich eBay listing title (≤80 chars, plain text, no emojis, no all-caps hype). This will be pasted directly into the eBay title field.
+- "short_title": an ultra-compact label naming ONLY what unifies the lot — the single theme or connection that ties it together. Target 3 words; use 4 or 5 only if truly necessary. NOT a keyword-rich listing title. NOT a list of contents or artists. NOT a description. Just the unifier. Good examples: "70s Prog Rock", "Women's Vogue Patterns", "Chicago Matchbooks", "Delta Blues Revival", "Cold War Thrillers". Bad (too long/too specific): "Classic 70s Prog Rock CD Lot of 5 — Pink Floyd Yes Genesis".
 - "theme": one sentence explaining why the items belong together.
 - "item_ids": the list of item IDs in the lot.`;
 
@@ -57,7 +57,7 @@ Respond ONLY with valid JSON in this exact shape:
     {
       "id": "lot-1",
       "title": "string",
-      "short_title": "string (≤80 chars, eBay title)",
+      "short_title": "string (3 words ideal, 5 max; the unifier only)",
       "theme": "string",
       "item_ids": ["item-1", "item-3"]
     }
