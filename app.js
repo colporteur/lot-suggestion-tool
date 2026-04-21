@@ -133,14 +133,37 @@ Respond ONLY with valid JSON:
 // ======================== 2. Image compression ========================
 
 async function blobToBase64(blob) {
+  // FileReader's onerror fires with a ProgressEvent, not a real Error. If we
+  // let that propagate, the UI shows "[object ProgressEvent]". Wrap it with a
+  // useful message that names the file and hints at the most common cause
+  // (cloud-only photos that haven't been downloaded locally yet).
+  const fileInfo = `"${blob.name || 'unnamed'}" (${Math.round((blob.size || 0) / 1024)} KB)`;
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
-      const base64 = reader.result.split(',')[1];
-      resolve({ data: base64, mediaType: blob.type || 'image/jpeg' });
+      try {
+        const base64 = reader.result.split(',')[1];
+        resolve({ data: base64, mediaType: blob.type || 'image/jpeg' });
+      } catch (e) {
+        reject(new Error(`Could not read ${fileInfo}: ${e.message || e}`));
+      }
     };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
+    reader.onerror = () => {
+      const domErr = reader.error;
+      const detail = domErr ? `${domErr.name}: ${domErr.message}` : 'unknown FileReader error';
+      reject(new Error(
+        `Could not read ${fileInfo} (${detail}). ` +
+        `If this photo is from Google Photos, it may still be in the cloud — open it once in the Photos app to download it locally, then retry.`
+      ));
+    };
+    reader.onabort = () => {
+      reject(new Error(`Reading ${fileInfo} was aborted.`));
+    };
+    try {
+      reader.readAsDataURL(blob);
+    } catch (e) {
+      reject(new Error(`Could not start reading ${fileInfo}: ${e.message || e}`));
+    }
   });
 }
 
