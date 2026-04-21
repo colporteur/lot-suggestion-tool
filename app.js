@@ -144,15 +144,60 @@ async function blobToBase64(blob) {
   });
 }
 
-async function compressImage(file) {
-  const img = await new Promise((resolve, reject) => {
-    const i = new Image();
-    i.onload = () => resolve(i);
-    i.onerror = () => reject(new Error('Could not read image file.'));
-    i.src = URL.createObjectURL(file);
-  });
+// Decode a File into something canvas-drawable. Tries createImageBitmap first
+// (faster, handles more formats) and falls back to an <img> element.
+async function decodeImage(file) {
+  const fileInfo = `"${file.name || 'unnamed'}" (type: ${file.type || 'unknown'}, ${Math.round((file.size || 0) / 1024)} KB)`;
 
-  let { width, height } = img;
+  // HEIC/HEIF is the most common failure mode on Android. Catch it with a clear message.
+  const nameLower = (file.name || '').toLowerCase();
+  const isHeic = /image\/hei[cf]/.test(file.type || '') ||
+                 nameLower.endsWith('.heic') || nameLower.endsWith('.heif');
+  if (isHeic) {
+    throw new Error(
+      `${fileInfo} is in HEIC/HEIF format, which Chrome can't read in-browser. ` +
+      `Fix: open your camera app settings and switch the photo format to JPEG (sometimes called "Most compatible"), or re-save this photo as JPEG. Then retry.`
+    );
+  }
+
+  if (!file.size || file.size === 0) {
+    throw new Error(
+      `${fileInfo} has zero bytes. If you picked it from Google Photos, it may still be in the cloud — open it in the Photos app once to download it locally, then retry.`
+    );
+  }
+
+  // Primary path: createImageBitmap (fast, async-decodes).
+  try {
+    return await createImageBitmap(file);
+  } catch (_) {
+    // Fall through to <img> fallback.
+  }
+
+  // Fallback: <img> element + object URL.
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = () => reject(new Error(
+        `Could not decode image ${fileInfo}. The file may be corrupt or in an unsupported format.`
+      ));
+      i.src = objectUrl;
+    });
+    // Keep the URL alive for the caller to draw from; caller should revoke.
+    img._objectUrl = objectUrl;
+    return img;
+  } catch (err) {
+    URL.revokeObjectURL(objectUrl);
+    throw err;
+  }
+}
+
+async function compressImage(file) {
+  const source = await decodeImage(file);
+
+  let width = source.width;
+  let height = source.height;
   const longest = Math.max(width, height);
   if (longest > MAX_IMAGE_DIMENSION) {
     const scale = MAX_IMAGE_DIMENSION / longest;
@@ -163,8 +208,11 @@ async function compressImage(file) {
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
-  canvas.getContext('2d').drawImage(img, 0, 0, width, height);
-  URL.revokeObjectURL(img.src);
+  canvas.getContext('2d').drawImage(source, 0, 0, width, height);
+
+  // Clean up the decoded source.
+  if (typeof source.close === 'function') source.close(); // ImageBitmap
+  if (source._objectUrl) URL.revokeObjectURL(source._objectUrl); // <img> fallback
 
   for (const quality of [0.85, 0.75, 0.65, 0.55, 0.45, 0.35]) {
     const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', quality));
@@ -173,7 +221,6 @@ async function compressImage(file) {
     if (encoded.data.length <= MAX_BASE64_BYTES) return encoded;
   }
 
-  // Fallback: return whatever we got at 0.3 quality even if still oversized.
   const fallback = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.3));
   return await blobToBase64(fallback);
 }
