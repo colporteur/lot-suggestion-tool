@@ -315,7 +315,10 @@ async function callAnthropic({ apiKey, systemPrompt, userContent }) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 4096,
+      // Generous ceiling: a batch of ~6 photos with 30+ items can easily exceed
+      // 4k tokens of output JSON. Sonnet 4.6 supports much more; 16k leaves
+      // plenty of headroom without affecting latency for small batches.
+      max_tokens: 16384,
       system: systemPrompt,
       messages: [{ role: 'user', content: userContent }]
     })
@@ -331,17 +334,34 @@ async function callAnthropic({ apiKey, systemPrompt, userContent }) {
   if (!textBlock) throw new Error('Claude returned no text response.');
 
   const raw = textBlock.text.trim();
+  const stopReason = result.stop_reason; // 'end_turn' | 'max_tokens' | 'stop_sequence' | ...
+
   let jsonString = raw;
   if (!raw.startsWith('{')) {
     const match = raw.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error('Could not find JSON in Claude response.');
+    if (!match) {
+      throw new Error(
+        `Could not find JSON in Claude response (stop_reason=${stopReason}). ` +
+        `Response starts: "${raw.slice(0, 200)}..."`
+      );
+    }
     jsonString = match[0];
   }
   try {
     return JSON.parse(jsonString);
   } catch (err) {
     console.error('Failed to parse Claude response:', raw);
-    throw new Error('Claude response was not valid JSON.');
+    // If we hit the token ceiling, that's almost certainly the cause — say so.
+    if (stopReason === 'max_tokens') {
+      throw new Error(
+        `Claude's response was cut off at the ${16384} token limit before it finished the JSON. ` +
+        `Try fewer photos in this batch, or fewer requested lots.`
+      );
+    }
+    throw new Error(
+      `Claude response was not valid JSON (stop_reason=${stopReason}). ` +
+      `Parser error: ${err.message}. Last 200 chars: "...${raw.slice(-200)}"`
+    );
   }
 }
 
