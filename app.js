@@ -16,6 +16,9 @@ const { useState, useEffect, useRef } = React;
 
 // ======================== 1. Constants & prompts ========================
 
+// Bump this whenever you push a change. The version shows in the footer so
+// you can confirm at a glance which build is running on the phone.
+const APP_VERSION = '0.3.0';
 const MODEL = 'claude-sonnet-4-6';
 const LS_API_KEY = 'lot-tool.apiKey';
 const LS_CATEGORY = 'lot-tool.lastCategory';
@@ -1189,6 +1192,7 @@ function App() {
 
       <footer className="text-xs text-slate-500 text-center py-6">
         Your API key stays on this device. Calls go directly to Anthropic.
+        <div className="mt-1 text-slate-600">v{APP_VERSION}</div>
       </footer>
 
       <SettingsModal
