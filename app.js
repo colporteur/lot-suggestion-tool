@@ -18,7 +18,7 @@ const { useState, useEffect, useRef } = React;
 
 // Bump this whenever you push a change. The version shows in the footer so
 // you can confirm at a glance which build is running on the phone.
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.4.0';
 const MODEL = 'claude-sonnet-4-6';
 const LS_API_KEY = 'lot-tool.apiKey';
 const LS_CATEGORY = 'lot-tool.lastCategory';
@@ -131,6 +131,85 @@ Respond ONLY with valid JSON:
     { "lot_id": "lot-existing-id", "item_ids": ["item-N"] }
   ],
   "unassigned_item_ids": []
+}`;
+
+const SINGLE_LOT_SYSTEM_PROMPT = `You are an expert at identifying collectibles for eBay resale.
+
+${JSON_CONVENTIONS}
+
+Your task: Judge whether the attached items could all be sold together as ONE coherent eBay lot with a clear unifying salable theme, or whether splitting them into multiple lots would add value (e.g. because distinct sub-themes command separate buyers, or the batch is a grab-bag).
+
+- If the batch is clearly one coherent lot, return verdict "single_lot" AND identify every item plus a single lot entry.
+- If the batch would sell better as multiple lots, return verdict "split" with a brief one-sentence reason and nothing else. Do NOT attempt the split — the user will kick off a separate workflow for that.
+
+Be willing to call "single_lot" only when the theme is genuinely tight (same genre + era + format, single artist/designer, a named collection, etc.). If there are obvious sub-groupings, say "split".
+
+Respond ONLY with valid JSON in one of these two shapes.
+
+Single-lot shape:
+{
+  "verdict": "single_lot",
+  "items": [
+    { "id": "item-1", "name": "string", "source": "Photo 1", "notes": "string (optional)" }
+  ],
+  "lot": {
+    "id": "lot-1",
+    "title": "string",
+    "short_title": "string (3 words ideal, 5 max; the unifier only)",
+    "theme": "string"
+  }
+}
+
+Split shape:
+{
+  "verdict": "split",
+  "reason": "one sentence why splitting adds value"
+}`;
+
+const REEVALUATE_SYSTEM_PROMPT = `You are re-evaluating a single item that was previously unassigned or marked not-recommended, given new information (a clearer photo, a text hint, or both).
+
+${JSON_CONVENTIONS}
+
+You will receive:
+- The current lot organization (existing items and lots)
+- The specific item being re-evaluated (its ID, current name, current reason for being unassigned/not-recommended)
+- New information about it: a replacement photo, a user-typed hint, or both
+
+Your task:
+1. Use the new information to refine your understanding of the item. Update its name/notes if warranted.
+2. Decide the item's placement among these options:
+   - An existing lot ID (if it now fits one well)
+   - "unassigned" (it's lot-worthy but still doesn't fit any existing lot)
+   - "not_recommended" (it shouldn't be lotted; give a brief reason)
+3. DO NOT create new lots. DO NOT modify any other item's placement.
+
+Respond ONLY with valid JSON:
+
+{
+  "placement": "lot-X" | "unassigned" | "not_recommended",
+  "updated_name": "string (optional — only if new info reveals a better name)",
+  "updated_notes": "string (optional)",
+  "reason": "string (brief explanation of the decision)"
+}`;
+
+const LEAST_BAD_FIT_SYSTEM_PROMPT = `You are force-placing a single item into one of the existing lots against your better judgment. The user has already heard your recommendation — they want the item lotted anyway and are asking you to identify the least sub-optimal destination.
+
+${JSON_CONVENTIONS}
+
+You will receive:
+- The current lot organization (existing items and lots)
+- The specific item being force-placed
+
+Your task:
+1. Pick the single existing lot that would be the least sub-optimal fit for this item. Lean into thematic overlap, era, format, adjacency — anything that makes the fit less awkward.
+2. You may only refuse if absolutely no existing lot would be defensible (e.g. item category is wholly unrelated to all lots). In that case return "not_recommended" with a reason.
+3. DO NOT create new lots. DO NOT modify any other item's placement.
+
+Respond ONLY with valid JSON:
+
+{
+  "placement": "lot-X" | "not_recommended",
+  "reason": "string (brief explanation of why this is the least-bad fit, or why no lot works)"
 }`;
 
 // ======================== 2. Image compression ========================
@@ -476,6 +555,130 @@ async function reassignDissolvedItems({ apiKey, remainingLots, itemsToReassign, 
   return await callAnthropic({ apiKey, systemPrompt: DISSOLVE_SYSTEM_PROMPT, userContent });
 }
 
+async function analyzeSingleLot({ apiKey, images, itemCategory }) {
+  if (!apiKey) throw new Error('No API key provided.');
+  if (!images || images.length === 0) throw new Error('At least one photo is required.');
+
+  const imageBlocks = await Promise.all(
+    images.map(async (img) => {
+      const { data, mediaType } = await compressImage(img);
+      return { type: 'image', source: { type: 'base64', media_type: mediaType, data } };
+    })
+  );
+
+  const userContent = [];
+  imageBlocks.forEach((block, idx) => {
+    userContent.push({ type: 'text', text: `Photo ${idx + 1}:` });
+    userContent.push(block);
+  });
+
+  const categoryHint = itemCategory ? `The items are primarily ${itemCategory}. ` : '';
+  userContent.push({
+    type: 'text',
+    text: `${categoryHint}Decide single_lot vs split, then return JSON accordingly.`.trim()
+  });
+
+  return await callAnthropic({ apiKey, systemPrompt: SINGLE_LOT_SYSTEM_PROMPT, userContent });
+}
+
+async function reevaluateItem({ apiKey, currentResult, item, replacementImage, hint, itemCategory }) {
+  // Build the lot-context snapshot Claude needs to decide placement.
+  const existingLotsForModel = (currentResult.lots || []).map((l) => ({
+    id: l.id,
+    title: l.title,
+    short_title: l.short_title,
+    theme: l.theme,
+    item_ids: l.item_ids
+  }));
+
+  // Figure out why this item is currently sidelined, so we can tell Claude.
+  let currentStatus = 'unassigned';
+  let currentReason = '';
+  if ((currentResult.unassigned_item_ids || []).includes(item.id)) {
+    currentStatus = 'unassigned';
+  } else {
+    const nr = (currentResult.not_recommended || []).find((e) => e.item_id === item.id);
+    if (nr) {
+      currentStatus = 'not_recommended';
+      currentReason = nr.reason || '';
+    }
+  }
+
+  const context = {
+    existing_items: currentResult.items || [],
+    existing_lots: existingLotsForModel,
+    item_under_review: {
+      id: item.id,
+      current_name: item.name,
+      current_source: item.source,
+      current_notes: item.notes || '',
+      current_status: currentStatus,
+      current_reason: currentReason
+    }
+  };
+
+  const userContent = [
+    {
+      type: 'text',
+      text: `Current state and item under review:\n\n${JSON.stringify(context, null, 2)}`
+    }
+  ];
+
+  if (replacementImage) {
+    const { data, mediaType } = await compressImage(replacementImage);
+    userContent.push({
+      type: 'text',
+      text: `Replacement photo of item "${item.id}" (clearer view — use this to refine identification):`
+    });
+    userContent.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data } });
+  }
+
+  if (hint && hint.trim()) {
+    userContent.push({
+      type: 'text',
+      text: `User-supplied hint about item "${item.id}":\n\n${hint.trim()}`
+    });
+  }
+
+  const categoryHint = itemCategory ? ` Items are primarily ${itemCategory}.` : '';
+  userContent.push({
+    type: 'text',
+    text: `Re-evaluate item "${item.id}" and return the placement JSON.${categoryHint}`
+  });
+
+  return await callAnthropic({ apiKey, systemPrompt: REEVALUATE_SYSTEM_PROMPT, userContent });
+}
+
+async function leastBadFit({ apiKey, currentResult, item, itemCategory }) {
+  const existingLotsForModel = (currentResult.lots || []).map((l) => ({
+    id: l.id,
+    title: l.title,
+    short_title: l.short_title,
+    theme: l.theme,
+    item_ids: l.item_ids
+  }));
+
+  const context = {
+    existing_lots: existingLotsForModel,
+    item_under_review: {
+      id: item.id,
+      name: item.name,
+      source: item.source,
+      notes: item.notes || ''
+    }
+  };
+
+  const categoryHint = itemCategory ? ` Items are primarily ${itemCategory}.` : '';
+  const userContent = [
+    {
+      type: 'text',
+      text: `Force-place this item into the least sub-optimal existing lot.${categoryHint}\n\n${JSON.stringify(context, null, 2)}`
+    }
+  ];
+
+  return await callAnthropic({ apiKey, systemPrompt: LEAST_BAD_FIT_SYSTEM_PROMPT, userContent });
+}
+
 // ======================== 4. Merge helpers ========================
 
 // Attach a stable lot_number to each lot (client-side bookkeeping).
@@ -517,6 +720,87 @@ function mergeStragglers(result, additions) {
     lots,
     unassigned_item_ids: unassigned,
     not_recommended: notRecommended
+  };
+}
+
+// Build a full result object from a SINGLE_LOT verdict. Shapes it exactly like
+// a normal multi-lot result so LotsView can render it — but with a flag so the
+// sorting guide and dissolve button can be hidden (single lot = no sorting, no
+// point in dissolving).
+function buildSingleLotResult(response) {
+  const lot = response.lot || {};
+  const items = response.items || [];
+  return {
+    items,
+    lots: [{
+      id: lot.id || 'lot-1',
+      lot_number: 1,
+      title: lot.title || '',
+      short_title: lot.short_title || '',
+      theme: lot.theme || '',
+      item_ids: items.map((i) => i.id)
+    }],
+    unassigned_item_ids: [],
+    not_recommended: [],
+    is_single_lot: true
+  };
+}
+
+// Apply a re-evaluation response to the current result: move the item from its
+// current bucket (unassigned or not_recommended) to wherever Claude placed it.
+// No new lots are created — the prompt forbids it.
+function applyReevaluation(result, itemId, response) {
+  const placement = response.placement;
+  const reason = response.reason || '';
+
+  // Optionally refresh the item's name/notes.
+  const items = (result.items || []).map((it) => {
+    if (it.id !== itemId) return it;
+    const next = { ...it };
+    if (response.updated_name) next.name = response.updated_name;
+    if (response.updated_notes) next.notes = response.updated_notes;
+    return next;
+  });
+
+  // Remove the item from its current bucket wherever it lives.
+  const unassignedCleared = (result.unassigned_item_ids || []).filter((iid) => iid !== itemId);
+  const notRecommendedCleared = (result.not_recommended || []).filter((e) => e.item_id !== itemId);
+
+  // Also strip it from any lot it might already be in (defensive; usually not needed).
+  const lotsCleaned = (result.lots || []).map((lot) => ({
+    ...lot,
+    item_ids: lot.item_ids.filter((iid) => iid !== itemId)
+  }));
+
+  if (placement === 'unassigned') {
+    return {
+      ...result,
+      items,
+      lots: lotsCleaned,
+      unassigned_item_ids: [...unassignedCleared, itemId],
+      not_recommended: notRecommendedCleared
+    };
+  }
+  if (placement === 'not_recommended') {
+    return {
+      ...result,
+      items,
+      lots: lotsCleaned,
+      unassigned_item_ids: unassignedCleared,
+      not_recommended: [...notRecommendedCleared, { item_id: itemId, reason }]
+    };
+  }
+  // Otherwise placement is a lot ID — add the item to that lot.
+  const lotsWithItem = lotsCleaned.map((lot) => {
+    if (lot.id !== placement) return lot;
+    return { ...lot, item_ids: [...lot.item_ids, itemId] };
+  });
+  return {
+    ...result,
+    items,
+    lots: lotsWithItem,
+    unassigned_item_ids: unassignedCleared,
+    not_recommended: notRecommendedCleared
   };
 }
 
@@ -781,7 +1065,7 @@ function CopyPill({ text }) {
   );
 }
 
-function LotCard({ lot, items, onDissolve }) {
+function LotCard({ lot, items, onDissolve, showDissolve = true }) {
   return (
     <div className="rounded-lg border border-slate-700 bg-slate-800 p-4">
       <div className="flex items-start justify-between mb-2 gap-2">
@@ -789,13 +1073,15 @@ function LotCard({ lot, items, onDissolve }) {
           <span className="text-slate-400 mr-1">Lot {lot.lot_number}:</span>
           {lot.title}
         </h3>
-        <button
-          onClick={onDissolve}
-          className="shrink-0 text-xs rounded bg-slate-700 hover:bg-red-700 px-2 py-1"
-          title="Dissolve this lot and reassign its items to other lots"
-        >
-          Dissolve
-        </button>
+        {showDissolve && (
+          <button
+            onClick={onDissolve}
+            className="shrink-0 text-xs rounded bg-slate-700 hover:bg-red-700 px-2 py-1"
+            title="Dissolve this lot and reassign its items to other lots"
+          >
+            Dissolve
+          </button>
+        )}
       </div>
 
       <p className="text-sm text-slate-400 italic mb-3">{lot.theme}</p>
@@ -885,38 +1171,193 @@ function SortingView({ result }) {
   );
 }
 
-function UnassignedView({ result }) {
+// Row for one unassigned or not-recommended item, with three reprocessing
+// actions: replacement photo, text hint, and least-bad-fit. Each action
+// reveals a small inline form or fires directly. All three route through
+// the parent's onReprocess callback; the parent calls Claude and merges the
+// response back into state.
+function ItemReprocessRow({ item, reason, bucket, loading, onReprocess, onError }) {
+  // Which inline form (if any) is currently open.
+  const [mode, setMode] = useState(null); // null | 'photo' | 'hint'
+  const [hint, setHint] = useState('');
+  const fileRef = useRef(null);
+
+  async function submitPhoto(file) {
+    if (!file) return;
+    try {
+      const snapped = await snapshotFile(file);
+      onReprocess({ kind: 'reevaluate', item, replacementImage: snapped, hint: '' });
+      setMode(null);
+    } catch (err) {
+      onError && onError(err.message || String(err));
+    }
+  }
+
+  function submitHint() {
+    if (!hint.trim()) return;
+    onReprocess({ kind: 'reevaluate', item, replacementImage: null, hint: hint.trim() });
+    setHint('');
+    setMode(null);
+  }
+
+  function submitLeastBadFit() {
+    onReprocess({ kind: 'least_bad_fit', item });
+  }
+
+  return (
+    <li className={bucket === 'unassigned' ? 'text-amber-100' : 'text-slate-400'}>
+      <div className="flex flex-wrap items-baseline gap-x-2">
+        <span className={`font-medium ${bucket === 'unassigned' ? 'text-amber-200' : 'text-slate-300'}`}>
+          {item.name}
+        </span>
+        {reason && <span className="text-xs text-slate-400">— {reason}</span>}
+      </div>
+
+      <div className="mt-1 flex flex-wrap gap-2 text-xs">
+        <button
+          onClick={() => { setMode(mode === 'photo' ? null : 'photo'); }}
+          disabled={loading}
+          className="rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50 px-2 py-1"
+        >
+          Add photo
+        </button>
+        <button
+          onClick={() => { setMode(mode === 'hint' ? null : 'hint'); }}
+          disabled={loading}
+          className="rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50 px-2 py-1"
+        >
+          Add hint
+        </button>
+        <button
+          onClick={submitLeastBadFit}
+          disabled={loading}
+          className="rounded bg-slate-700 hover:bg-amber-700 disabled:opacity-50 px-2 py-1"
+          title="Ask Claude to pick the least sub-optimal existing lot, against its better judgment."
+        >
+          Least-bad fit
+        </button>
+      </div>
+
+      {mode === 'photo' && (
+        <div className="mt-2">
+          <input
+            ref={fileRef}
+            type="file"
+            accept="image/*"
+            onChange={(e) => {
+              const f = (e.target.files || [])[0];
+              e.target.value = '';
+              submitPhoto(f);
+            }}
+            className="hidden"
+          />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => fileRef.current && fileRef.current.click()}
+              disabled={loading}
+              className="rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 px-3 py-1 text-xs"
+            >
+              Pick a photo
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode(null)}
+              className="rounded bg-slate-700 hover:bg-slate-600 px-3 py-1 text-xs"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {mode === 'hint' && (
+        <div className="mt-2 space-y-2">
+          <textarea
+            value={hint}
+            onChange={(e) => setHint(e.target.value)}
+            placeholder='e.g. "This is a 1997 first pressing of Wilco — Being There"'
+            rows={2}
+            className="w-full rounded bg-slate-900 border border-slate-700 px-2 py-1 text-xs text-slate-100"
+          />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={submitHint}
+              disabled={loading || !hint.trim()}
+              className="rounded bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 px-3 py-1 text-xs"
+            >
+              Re-evaluate with hint
+            </button>
+            <button
+              type="button"
+              onClick={() => { setMode(null); setHint(''); }}
+              className="rounded bg-slate-700 hover:bg-slate-600 px-3 py-1 text-xs"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </li>
+  );
+}
+
+function UnassignedView({ result, loading, onReprocess, onError }) {
   const unassigned = result?.unassigned_item_ids || [];
   const items = result?.items || [];
   if (unassigned.length === 0) return null;
   return (
     <div className="rounded-lg border border-amber-700 bg-amber-900/30 p-4">
       <h3 className="text-lg font-semibold text-amber-300 mb-2">Unassigned items</h3>
-      <ul className="list-disc list-inside space-y-1 text-sm">
+      <p className="text-xs text-amber-200/70 mb-2">
+        Lot-worthy, but didn't fit any of the current lots. Clarify with a photo or hint, or force a least-bad fit.
+      </p>
+      <ul className="space-y-3 text-sm">
         {unassigned.map((iid) => {
           const item = items.find((i) => i.id === iid);
-          return item ? <li key={iid}>{item.name}</li> : null;
+          if (!item) return null;
+          return (
+            <ItemReprocessRow
+              key={iid}
+              item={item}
+              reason=""
+              bucket="unassigned"
+              loading={loading}
+              onReprocess={onReprocess}
+              onError={onError}
+            />
+          );
         })}
       </ul>
     </div>
   );
 }
 
-function NotRecommendedView({ result }) {
+function NotRecommendedView({ result, loading, onReprocess, onError }) {
   const items = result?.items || [];
   const nr = result?.not_recommended || [];
   if (nr.length === 0) return null;
   return (
     <div className="rounded-lg border border-slate-700 bg-slate-800/60 p-4">
       <h3 className="text-sm font-semibold text-slate-400 mb-2">Not recommended for inclusion in a lot</h3>
-      <ul className="space-y-1 text-sm">
+      <p className="text-xs text-slate-500 mb-2">
+        Claude judged these shouldn't be lotted. If you disagree, clarify with a photo/hint — or ask for a least-bad fit.
+      </p>
+      <ul className="space-y-3 text-sm">
         {nr.map((entry) => {
           const item = items.find((i) => i.id === entry.item_id);
           if (!item) return null;
           return (
-            <li key={entry.item_id} className="text-slate-400">
-              <span className="font-medium text-slate-300">{item.name}</span> — {entry.reason}
-            </li>
+            <ItemReprocessRow
+              key={entry.item_id}
+              item={item}
+              reason={entry.reason}
+              bucket="not_recommended"
+              loading={loading}
+              onReprocess={onReprocess}
+              onError={onError}
+            />
           );
         })}
       </ul>
@@ -991,8 +1432,9 @@ function StragglerForm({ onSubmit, onError, loading }) {
   );
 }
 
-function LotsView({ result, onDissolve }) {
+function LotsView({ result, onDissolve, loading, onReprocess, onError }) {
   if (!result) return null;
+  const isSingleLot = !!result.is_single_lot;
   return (
     <div className="space-y-4">
       {(result.lots || []).map((lot) => (
@@ -1001,11 +1443,22 @@ function LotsView({ result, onDissolve }) {
           lot={lot}
           items={result.items || []}
           onDissolve={() => onDissolve(lot.id)}
+          showDissolve={!isSingleLot}
         />
       ))}
-      <SortingView result={result} />
-      <UnassignedView result={result} />
-      <NotRecommendedView result={result} />
+      {!isSingleLot && <SortingView result={result} />}
+      <UnassignedView
+        result={result}
+        loading={loading}
+        onReprocess={onReprocess}
+        onError={onError}
+      />
+      <NotRecommendedView
+        result={result}
+        loading={loading}
+        onReprocess={onReprocess}
+        onError={onError}
+      />
       {result.notes_to_seller && (
         <div className="rounded-lg border border-slate-700 bg-slate-800 p-4">
           <h3 className="text-sm font-semibold text-slate-300 mb-1">Notes</h3>
@@ -1033,6 +1486,9 @@ function App() {
   const [loadingMessage, setLoadingMessage] = useState('');
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
+  // When "Is this one lot?" returns verdict=split, we surface Claude's one-liner
+  // reason above the auto-generated multi-lot result so the user knows why.
+  const [splitReason, setSplitReason] = useState('');
 
   // Settings modal visibility. Auto-open on first load if no key has ever been saved.
   const [showSettings, setShowSettings] = useState(() => !localStorage.getItem(LS_API_KEY));
@@ -1045,16 +1501,86 @@ function App() {
     setImages([]);
     setResult(null);
     setError('');
+    setSplitReason('');
   }
 
   async function handleSubmit() {
     setError('');
     setResult(null);
+    setSplitReason('');
     setLoading(true);
     setLoadingMessage('Analyzing photos…');
     try {
       const raw = await suggestLots({ apiKey, images, targetLotCount, fuzzy, itemCategory });
       setResult(assignInitialLotNumbers(raw));
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setLoading(false);
+      setLoadingMessage('');
+    }
+  }
+
+  // "Is this one lot?" — ask Claude first whether the batch is one coherent lot
+  // or needs splitting. If single_lot, render that result directly (no sorting
+  // guide, no dissolve). If split, surface the reason and automatically run the
+  // normal Suggest-Lots flow so the user doesn't have to tap anything else.
+  async function handleAnalyzeSingleLot() {
+    setError('');
+    setResult(null);
+    setSplitReason('');
+    setLoading(true);
+    setLoadingMessage('Checking if this is one lot…');
+    try {
+      const response = await analyzeSingleLot({ apiKey, images, itemCategory });
+      if (response.verdict === 'single_lot') {
+        setResult(buildSingleLotResult(response));
+        return;
+      }
+      // Verdict = split. Auto-continue into the multi-lot flow.
+      setSplitReason(response.reason || '');
+      setLoadingMessage('Not one lot — suggesting a breakdown…');
+      const raw = await suggestLots({ apiKey, images, targetLotCount, fuzzy, itemCategory });
+      setResult(assignInitialLotNumbers(raw));
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setLoading(false);
+      setLoadingMessage('');
+    }
+  }
+
+  // Reprocess one unassigned / not-recommended item. Kind is either
+  // 'reevaluate' (with optional replacement photo + hint) or 'least_bad_fit'.
+  async function handleReprocess(payload) {
+    if (!result) return;
+    setError('');
+    setLoading(true);
+    setLoadingMessage(
+      payload.kind === 'least_bad_fit'
+        ? `Picking least-bad fit for "${payload.item.name}"…`
+        : `Re-evaluating "${payload.item.name}"…`
+    );
+    try {
+      let response;
+      if (payload.kind === 'reevaluate') {
+        response = await reevaluateItem({
+          apiKey,
+          currentResult: result,
+          item: payload.item,
+          replacementImage: payload.replacementImage,
+          hint: payload.hint,
+          itemCategory
+        });
+      } else {
+        response = await leastBadFit({
+          apiKey,
+          currentResult: result,
+          item: payload.item,
+          itemCategory
+        });
+      }
+      setResult(applyReevaluation(result, payload.item.id, response));
     } catch (err) {
       setError(err.message || String(err));
     } finally {
@@ -1163,6 +1689,15 @@ function App() {
         {loading && !result ? (loadingMessage || 'Thinking…') : 'Suggest lots'}
       </button>
 
+      <button
+        onClick={handleAnalyzeSingleLot}
+        disabled={!apiKey || images.length === 0 || loading}
+        className="w-full rounded border border-indigo-700 text-indigo-300 hover:bg-indigo-900/40 disabled:opacity-50 py-2 text-sm"
+        title="Ask Claude whether the batch stands as one lot; if not, it'll suggest a breakdown."
+      >
+        Is this one lot?
+      </button>
+
       {canStartOver && (
         <button
           onClick={handleStartOver}
@@ -1173,15 +1708,29 @@ function App() {
       )}
 
       {error && (
-        <div className="rounded border border-red-700 bg-red-900/40 p-3 text-sm text-red-200">
+        <div className="rounded border border-red-700 bg-red-900/40 p-3 text-sm text-red-200 whitespace-pre-wrap">
           {error}
+        </div>
+      )}
+
+      {splitReason && (
+        <div className="rounded border border-indigo-700 bg-indigo-900/30 p-3 text-sm text-indigo-200">
+          <span className="font-medium">Claude recommended splitting:</span> {splitReason}
         </div>
       )}
 
       {result && (
         <>
-          <LotsView result={result} onDissolve={handleDissolveLot} />
-          <StragglerForm onSubmit={handleAddStragglers} onError={setError} loading={loading} />
+          <LotsView
+            result={result}
+            onDissolve={handleDissolveLot}
+            loading={loading}
+            onReprocess={handleReprocess}
+            onError={setError}
+          />
+          {!result.is_single_lot && (
+            <StragglerForm onSubmit={handleAddStragglers} onError={setError} loading={loading} />
+          )}
           {loading && (
             <div className="rounded border border-slate-700 bg-slate-800 p-3 text-sm text-slate-300 text-center">
               {loadingMessage || 'Working…'}
